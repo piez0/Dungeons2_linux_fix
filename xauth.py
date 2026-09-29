@@ -7,11 +7,14 @@ for the local runtime; they are never printed.
 import base64
 import json
 import os
+import struct
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 CLIENT = "00000000497C1B94"
 SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
@@ -20,10 +23,48 @@ TOKEN_PATH = os.path.join(HERE, "tokens.txt")
 CODE_PATH = os.path.join(HERE, "login-code.txt")
 
 
-def post(url, form=None, payload=None):
+class ProofKey:
+    """P-256 key that signs Xbox auth requests and binds tokens to a device.
+
+    The Steam runtime's python has no crypto module, so this uses the
+    openssl CLI that ships in the runtime.
+    """
+
+    def __init__(self):
+        fd, self.path = tempfile.mkstemp(suffix=".pem")
+        os.close(fd)
+        self._openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", self.path)
+        point = self._openssl("ec", "-in", self.path, "-pubout", "-outform", "DER")[-64:]
+        b64 = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+        self.jwk = {"kty": "EC", "x": b64(point[:32]), "y": b64(point[32:]),
+                    "crv": "P-256", "alg": "ES256", "use": "sig"}
+
+    def _openssl(self, *args, data=None):
+        return subprocess.run(["openssl", *args], input=data, capture_output=True, check=True).stdout
+
+    def signature(self, url, body):
+        stamp = (int(time.time()) + 11644473600) * 10000000
+        path = urllib.parse.urlsplit(url).path
+        signed = (struct.pack(">I", 1) + b"\0" + struct.pack(">Q", stamp) + b"\0POST\0"
+                  + path.encode() + b"\0\0" + body + b"\0")
+        der = self._openssl("dgst", "-sha256", "-sign", self.path, data=signed)
+        rlen = der[3]
+        r = int.from_bytes(der[4:4 + rlen], "big")
+        s = int.from_bytes(der[6 + rlen:6 + rlen + der[5 + rlen]], "big")
+        raw = struct.pack(">I", 1) + struct.pack(">Q", stamp) + r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        return base64.b64encode(raw).decode()
+
+    def close(self):
+        os.unlink(self.path)
+
+
+def post(url, form=None, payload=None, key=None):
     if payload is not None:
         data = json.dumps(payload).encode()
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if key:
+            headers["Signature"] = key.signature(url, data)
+            headers["x-xbl-contract-version"] = "1"
     else:
         data = urllib.parse.urlencode(form).encode()
         headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
@@ -87,11 +128,14 @@ def cached_ok():
     if not os.path.isfile(TOKEN_PATH):
         return False
     exp = 0
+    playfab = False
     with open(TOKEN_PATH, "r", encoding="utf-8") as handle:
         for line in handle:
             if line.startswith("exp="):
                 exp = int(line[4:].strip() or "0")
-    return exp > time.time() + 120
+            elif line.startswith("playfab=XBL"):
+                playfab = True
+    return playfab and exp > time.time() + 120
 
 
 def rps_ticket(access):
@@ -117,12 +161,31 @@ def xbox_user(access):
     return result["Token"]
 
 
-def xsts(user_token, relying):
+def device_token(key):
+    result = post("https://device.auth.xboxlive.com/device/authenticate", payload={
+        "Properties": {
+            "AuthMethod": "ProofOfPossession",
+            "Id": "{%s}" % uuid.uuid4(),
+            "DeviceType": "Win32",
+            "Version": "10.0.26100",
+            "ProofKey": key.jwk,
+        },
+        "RelyingParty": "http://auth.xboxlive.com",
+        "TokenType": "JWT",
+    }, key=key)
+    if "Token" not in result:
+        raise SystemExit("Xbox device auth failed: %s" % result.get("XErr", result.get("error", result.get("_status"))))
+    return result["Token"]
+
+
+# PlayFab rejects tokens without a device claim ("Unidentified DeviceType"),
+# so every XSTS token is bound to a device, as Gaming Services does.
+def xsts(user_token, relying, device, key):
     result = post("https://xsts.auth.xboxlive.com/xsts/authorize", payload={
-        "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
+        "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token], "DeviceToken": device},
         "RelyingParty": relying,
         "TokenType": "JWT",
-    })
+    }, key=key)
     if "Token" not in result:
         return None, result.get("XErr", result.get("error"))
     return result, None
@@ -206,18 +269,25 @@ def load_refresh():
 
 
 def finish(msa):
-    user_token = xbox_user(msa["access_token"])
-    xbox, xerr = xsts(user_token, "http://xboxlive.com")
-    if not xbox:
-        raise SystemExit("Xbox token failed: %s" % xerr)
-    minecraft, mc_err = xsts(user_token, "rp://api.minecraftservices.com/")
+    key = ProofKey()
+    try:
+        device = device_token(key)
+        user_token = xbox_user(msa["access_token"])
+        xbox, xerr = xsts(user_token, "http://xboxlive.com", device, key)
+        if not xbox:
+            raise SystemExit("Xbox token failed: %s" % xerr)
+        minecraft, mc_err = xsts(user_token, "rp://api.minecraftservices.com/", device, key)
+        playfab, pf_err = xsts(user_token, "http://playfab.xboxlive.com/", device, key)
+    finally:
+        key.close()
     header, claim = auth_header(xbox)
     mc_header = auth_header(minecraft)[0] if minecraft else header
+    pf_header = auth_header(playfab)[0] if playfab else header
     exp = jwt_exp(xbox["Token"])
-    if minecraft:
-        mc_exp = jwt_exp(minecraft["Token"])
-        if mc_exp:
-            exp = min(exp, mc_exp) if exp else mc_exp
+    for doc in (minecraft, playfab):
+        got = jwt_exp(doc["Token"]) if doc else 0
+        if got:
+            exp = min(exp, got) if exp else got
     if not exp:
         exp = int(time.time()) + 4 * 3600
     write_tokens([
@@ -227,9 +297,11 @@ def finish(msa):
         ("gamertag", claim.get("gtg", "Player")),
         ("xbox", header),
         ("mc", mc_header),
+        ("playfab", pf_header),
         ("msa", msa["access_token"]),
         ("refresh", msa.get("refresh_token", "")),
         ("mc_error", "" if minecraft else str(mc_err or "")),
+        ("playfab_error", "" if playfab else str(pf_err or "")),
     ])
 
 
