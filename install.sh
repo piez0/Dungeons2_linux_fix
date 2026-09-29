@@ -1,11 +1,13 @@
 #!/bin/sh
-# Copy xgameruntime.dll next to both game executables and into the Proton prefix.
+# Install or update the Gaming Services stand-in for Minecraft Dungeons II.
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-DLL="$ROOT/src/xgameruntime.dll"
+REPO=https://github.com/mahirsn/Dungeons2_linux_fix
+# xgameruntime.dll runs the sign-in helper from here, so the files must live here.
+DEST=$HOME/.local/share/dungeons2-compat
 APPID=1912410
-if [ ! -f "$DLL" ]; then
-    echo "Missing $DLL. Build it first; see README.md." >&2
+
+if pgrep -f 'Dungeons-Win64-Shipping' >/dev/null 2>&1; then
+    echo "Quit Minecraft Dungeons II first." >&2
     exit 1
 fi
 
@@ -28,21 +30,21 @@ LIB=$(awk '
     }
 ' "$VDF")
 if [ -z "$LIB" ]; then
-    echo "Steam app $APPID is not in any library folder." >&2
+    echo "Minecraft Dungeons II is not installed in Steam." >&2
     exit 1
 fi
 
 GAME="$LIB/steamapps/common/Minecraft Dungeons II"
 PFX="$LIB/steamapps/compatdata/$APPID/pfx/drive_c/windows/system32"
-SHIP="$GAME/Dungeons/Binaries/Win64"
-for dir in "$GAME" "$SHIP" "$PFX"; do
-    if [ ! -d "$dir" ]; then
-        echo "Missing $dir" >&2
-        exit 1
-    fi
-    cp -f "$DLL" "$dir/xgameruntime.dll"
-    echo "Installed $dir/xgameruntime.dll"
+if [ ! -d "$PFX" ]; then
+    echo "Start Minecraft Dungeons II once from Steam, close it, then run this again." >&2
+    exit 1
+fi
+
+mkdir -p "$DEST"
+curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" | tar -xz --strip-components=1 -C "$DEST"
+
+for dir in "$GAME" "$GAME/Dungeons/Binaries/Win64" "$PFX"; do
+    cp -f "$DEST/src/xgameruntime.dll" "$dir/xgameruntime.dll"
 done
-echo
-echo "In Steam, set this launch option for Minecraft Dungeons II:"
-echo '  WINEDLLOVERRIDES="xgameruntime=n" %command%'
+echo "Installed. Start Minecraft Dungeons II from Steam."

@@ -5,3 +5,5 @@ login-error.txt
 __pycache__/
 *.pyc
 src/test_xgr.exe
+src/xgameruntime.lib
+src/xgameruntime.pdb
