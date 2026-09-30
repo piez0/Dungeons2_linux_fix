@@ -11,7 +11,7 @@ if pgrep -f 'Dungeons-Win64-Shipping' >/dev/null 2>&1; then
     exit 1
 fi
 
-STEAM_ROOT=${STEAM_ROOT:-$HOME/.local/share/Steam}
+STEAM_ROOT=${STEAM_ROOT:-$HOME/mochidrift/.var/app/com.valvesoftware.Steam/data/Steam}
 if [ ! -f "$STEAM_ROOT/steamapps/libraryfolders.vdf" ] && [ -f "$HOME/.steam/steam/steamapps/libraryfolders.vdf" ]; then
     STEAM_ROOT=$HOME/.steam/steam
 fi
